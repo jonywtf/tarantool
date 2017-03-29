@@ -215,6 +215,11 @@ struct vy_run_iterator {
 	bool search_started;
 	/** Search is finished, you will not get more values from iterator */
 	bool search_ended;
+	/**
+	 * For infiniruns it is the right border of the range to
+	 * write. NULL for other runs.
+	 */
+	const char *end;
 };
 
 /**
@@ -341,8 +346,8 @@ void
 vy_run_iterator_open(struct vy_run_iterator *itr, bool coio_read,
 		     struct vy_iterator_stat *stat, struct vy_run_env *run_env,
 		     struct vy_run *run, enum iterator_type iterator_type,
-		     const struct tuple *key, const int64_t *vlsn,
-		     const struct key_def *key_def,
+		     const struct tuple *key, const char *end,
+		     const int64_t *vlsn, const struct key_def *key_def,
 		     const struct key_def *user_key_def,
 		     struct tuple_format *format,
 		     struct tuple_format *upsert_format,

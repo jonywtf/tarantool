@@ -995,8 +995,15 @@ vy_run_iterator_find_lsn(struct vy_run_iterator *itr, struct tuple **ret)
 		rc = rc > 0 ? 0 : rc;
 	}
 	tuple_unref(stmt);
-	if (!rc) /* If next_pos() found something then get it. */
-		rc = vy_run_iterator_get(itr, ret);
+	if (rc != 0 || (rc = vy_run_iterator_get(itr, ret)) != 0)
+		return rc;
+	/* If next_pos() found something then get it. */
+	if (itr->end != NULL && *ret != NULL &&
+	    vy_tuple_compare_with_raw_key(*ret, itr->end, key_def) >= 0) {
+		/* End of the search. */
+		*ret = NULL;
+		return 0;
+	}
 	return rc;
 }
 
@@ -1126,8 +1133,8 @@ void
 vy_run_iterator_open(struct vy_run_iterator *itr, bool coio_read,
 		     struct vy_iterator_stat *stat, struct vy_run_env *run_env,
 		     struct vy_run *run, enum iterator_type iterator_type,
-		     const struct tuple *key, const int64_t *vlsn,
-		     const struct key_def *key_def,
+		     const struct tuple *key, const char *end,
+		     const int64_t *vlsn, const struct key_def *key_def,
 		     const struct key_def *user_key_def,
 		     struct tuple_format *format,
 		     struct tuple_format *upsert_format,
@@ -1162,6 +1169,7 @@ vy_run_iterator_open(struct vy_run_iterator *itr, bool coio_read,
 
 	itr->search_started = false;
 	itr->search_ended = false;
+	itr->end = end;
 }
 
 /**
