@@ -1133,8 +1133,9 @@ void
 vy_run_iterator_open(struct vy_run_iterator *itr, bool coio_read,
 		     struct vy_iterator_stat *stat, struct vy_run_env *run_env,
 		     struct vy_run *run, enum iterator_type iterator_type,
-		     const struct tuple *key, const char *end,
-		     const int64_t *vlsn, const struct key_def *key_def,
+		     const struct tuple *key, struct tuple *start_from,
+		     const char *end, const int64_t *vlsn,
+		     const struct key_def *key_def,
 		     const struct key_def *user_key_def,
 		     struct tuple_format *format,
 		     struct tuple_format *upsert_format,
@@ -1170,6 +1171,9 @@ vy_run_iterator_open(struct vy_run_iterator *itr, bool coio_read,
 	itr->search_started = false;
 	itr->search_ended = false;
 	itr->end = end;
+	itr->start_from = start_from;
+	if (start_from != NULL)
+		tuple_ref(itr->start_from);
 }
 
 /**
@@ -1395,6 +1399,8 @@ vy_run_iterator_restore(struct vy_stmt_iterator *vitr,
 	struct vy_run_iterator *itr = (struct vy_run_iterator *) vitr;
 	*ret = NULL;
 	int rc;
+	if (! itr->search_started && last_stmt == NULL)
+		last_stmt = itr->start_from;
 
 	if (itr->search_started || last_stmt == NULL) {
 		if (!itr->search_started) {
@@ -1423,6 +1429,11 @@ vy_run_iterator_restore(struct vy_stmt_iterator *vitr,
 	else if (next == NULL)
 		return 0;
 	const struct key_def *def = itr->key_def;
+	/* Finish restore, if this actually was deferred start. */
+	if (last_stmt == itr->start_from) {
+		*ret = next;
+		return 0;
+	}
 	bool position_changed = true;
 	if (vy_stmt_compare(next, last_stmt, def) == 0) {
 		position_changed = false;
@@ -1476,6 +1487,8 @@ vy_run_iterator_close(struct vy_stmt_iterator *vitr)
 	struct vy_run_iterator *itr = (struct vy_run_iterator *) vitr;
 	/* cleanup() must be called before */
 	assert(itr->curr_stmt == NULL && itr->curr_page == NULL);
+	if (itr->start_from != NULL)
+		tuple_unref(itr->start_from);
 	TRASH(itr);
 	(void) itr;
 }

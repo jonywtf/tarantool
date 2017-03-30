@@ -220,6 +220,8 @@ struct vy_run_iterator {
 	 * write. NULL for other runs.
 	 */
 	const char *end;
+	/** Tuple for deferred restore. */
+	struct tuple *start_from;
 };
 
 /**
@@ -346,8 +348,9 @@ void
 vy_run_iterator_open(struct vy_run_iterator *itr, bool coio_read,
 		     struct vy_iterator_stat *stat, struct vy_run_env *run_env,
 		     struct vy_run *run, enum iterator_type iterator_type,
-		     const struct tuple *key, const char *end,
-		     const int64_t *vlsn, const struct key_def *key_def,
+		     const struct tuple *key, struct tuple *start_from,
+		     const char *end, const int64_t *vlsn,
+		     const struct key_def *key_def,
 		     const struct key_def *user_key_def,
 		     struct tuple_format *format,
 		     struct tuple_format *upsert_format,
