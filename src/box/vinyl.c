@@ -2461,13 +2461,15 @@ err_wi:
  */
 static struct vy_write_iterator *
 vy_range_get_compact_iterator(struct vy_range *range, int run_count,
-			      int64_t vlsn, int64_t dump_lsn,
-			      bool is_last_level, size_t *p_max_output_count)
+			      int64_t *compact_max_lsn_out, int64_t vlsn,
+			      int64_t dump_lsn, bool is_last_level,
+			      size_t *p_max_output_count)
 {
 	struct vy_index *index = range->index;
 	struct vy_write_iterator *wi;
 	struct vy_run *run;
 	struct vy_mem *mem;
+	int64_t compact_max_lsn = 0;
 	*p_max_output_count = 0;
 
 	wi = vy_write_iterator_new(index->env, &index->index_def->key_def,
@@ -2497,7 +2499,9 @@ vy_range_get_compact_iterator(struct vy_range *range, int run_count,
 		if (vy_write_iterator_add_run(wi, run, NULL) != 0)
 			goto err_wi_sub;
 		*p_max_output_count += run->info.keys;
+		compact_max_lsn = MAX(compact_max_lsn, run->info.max_lsn);
 	}
+	*compact_max_lsn_out = compact_max_lsn;
 	return wi;
 err_wi_sub:
 	vy_write_iterator_cleanup(wi);
@@ -3320,6 +3324,8 @@ struct vy_task {
 	 * abort.
 	 */
 	struct vy_stashed_level_zero *stash;
+	/** Maximal LSN of compacted runs. */
+	int64_t compact_max_lsn;
 };
 
 /**
@@ -3739,6 +3745,7 @@ vy_task_split_new(struct mempool *pool, struct vy_range *range,
 
 	struct vy_write_iterator *wi;
 	wi = vy_range_get_compact_iterator(range, range->run_count,
+					   &task->compact_max_lsn,
 					   tx_manager_vlsn(xm), dump_lsn, true,
 					   &task->max_output_count);
 	if (wi == NULL)
@@ -3956,6 +3963,8 @@ vy_task_coalesce_new(struct mempool *pool, struct vy_range *first,
 			if (vy_write_iterator_add_run(wi, run, NULL) != 0)
 				goto err_wi_sub;
 			task->max_output_count += run->info.keys;
+			task->compact_max_lsn = MAX(task->compact_max_lsn,
+						    run->info.max_lsn);
 		}
 		vy_scheduler_remove_range(scheduler, it);
 		it = vy_range_tree_next(&index->tree, it);
@@ -4126,6 +4135,7 @@ vy_task_compact_new(struct mempool *pool, struct vy_range *range,
 	struct vy_write_iterator *wi;
 	bool is_last_level = range->compact_priority == range->run_count;
 	wi = vy_range_get_compact_iterator(range, range->compact_priority,
+					   &task->compact_max_lsn,
 					   tx_manager_vlsn(xm), dump_lsn,
 					   is_last_level,
 					   &task->max_output_count);
