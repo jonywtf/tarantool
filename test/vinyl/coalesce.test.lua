@@ -46,11 +46,34 @@ end;
 test_run:cmd("setopt delimiter ''");
 
 -- Wait until compaction is over (ranges being compacted can't be coalesced)
-while vyinfo().range_count ~= vyinfo().run_count do fiber.sleep(0.01) end
+while vyinfo().range_count ~= vyinfo().run_count - vyinfo().infinirun_count do fiber.sleep(0.01) end
+
+-- Each infinirun after compaction must be either deleted or used
+-- by a range. Error, if there are unused infiniruns.
+-- Try to create an infinirun intersected with all ranges
+-- and infinirun intersected with only one range. After compact
+-- the second infinirun must be deleted.
+s:delete{1}
+s:delete{key_count}
+box.snapshot()
+s:delete{1}
+box.snapshot()
+fiber.sleep(0.01)
+info = vyinfo()
+assert(info.infinirun_count <= info.total_level_zero_run_count)
 
 -- Trigger range coalescing by calling compaction and wait until
 -- adjacent ranges are coalesced.
-while vyinfo().range_count > 1 do s:delete({1}) box.snapshot() fiber.sleep(0.01) end
+test_run:cmd("setopt delimiter ';'")
+while vyinfo().range_count > 1 do
+-- Create delete statement for each range to increase the
+-- level zero size and trigger coalescing.
+    for k = math.floor(keys_per_range / 2), key_count, keys_per_range do
+        s:delete({k}) box.snapshot()
+    end
+    fiber.sleep(0.01)
+end;
+test_run:cmd("setopt delimiter ''");
 
 vyinfo().range_count
 

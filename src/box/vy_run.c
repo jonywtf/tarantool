@@ -1014,6 +1014,7 @@ vy_run_iterator_find_lsn(struct vy_run_iterator *itr, struct tuple **ret)
 static NODISCARD int
 vy_run_iterator_next_key(struct vy_stmt_iterator *vitr, struct tuple **ret,
 			 bool *stop);
+
 /**
  * Find next (lower, older) record with the same key as current
  * Return true if the record was found
@@ -1429,8 +1430,14 @@ vy_run_iterator_restore(struct vy_stmt_iterator *vitr,
 	else if (next == NULL)
 		return 0;
 	const struct key_def *def = itr->key_def;
-	/* Finish restore, if this actually was deferred start. */
-	if (last_stmt == itr->start_from) {
+	/*
+	 * Finish restore, if this actually was deferred start to
+	 * the specified key. If it is not key (SELECT), then
+	 * it was deferred restore and the 'last_stmt' have to be
+	 * skipped.
+	 */
+	if (last_stmt == itr->start_from &&
+	    vy_stmt_type(last_stmt) == IPROTO_SELECT) {
 		*ret = next;
 		return 0;
 	}
