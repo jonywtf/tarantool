@@ -1,7 +1,12 @@
-fiber = require('fiber')
 env = require('test_run')
-replica_set = require('fast_replica')
 test_run = env.new()
+-- need to restart due to refresh box.space._cluster
+-- Simple delete doesn't help, because of fails in test-run
+test_run:cmd("restart server default with cleanup=1")
+test_run:cmd('switch default')
+
+fiber = require('fiber')
+replica_set = require('fast_replica')
 engine = test_run:get_cfg('engine')
 box.schema.user.grant('guest', 'read,write,execute', 'universe')
 

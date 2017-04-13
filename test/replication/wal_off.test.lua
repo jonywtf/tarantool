@@ -32,11 +32,7 @@ check = "Read access on universe is denied for user 'guest'"
 while box.info.replication[wal_off_id].upstream.message ~= check do fiber.sleep(0) end
 box.cfg { replication = "" }
 
-
-test_run:cmd("switch wal_off")
-test_run:cmd("stop server default")
-test_run:cmd("deploy server default")
-test_run:cmd("start server default")
-test_run:cmd("switch default")
 test_run:cmd("stop server wal_off")
 test_run:cmd("cleanup server wal_off")
+
+box.schema.user.revoke('guest', 'replication')

@@ -317,4 +317,5 @@ box.tuple.new(string.rep('x', 100 * 1024 * 1024)) == nil
 collectgarbage('collect') -- collect huge string
 
 test_run:cmd("clear filter")
+-- needed this restart because we need to reset tuple reference counter
 test_run:cmd("restart server default")

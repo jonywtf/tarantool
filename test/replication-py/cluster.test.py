@@ -270,6 +270,7 @@ print '-------------------------------------------------------------'
 # Cleanup
 sys.stdout.pop_filter()
 master.admin("box.schema.user.revoke('guest', 'replication')")
+# Standard cleanup for py tests. Need to reset counters of replicas.
 server.stop()
 server.cleanup(True)
 server.deploy()

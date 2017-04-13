@@ -107,10 +107,9 @@ box.cfg{io_collect_interval=0}
 box.cfg{too_long_threshold=0.5}
 ---
 ...
-env = require('test_run')
+box.cfg.snap_io_rate_limit = nil
 ---
 ...
-test_run = env.new()
+box.cfg.io_collect_interval = nil
 ---
 ...
-test_run:cmd("restart server default")

@@ -1552,4 +1552,5 @@ c4 = nil
 c5 = nil
 c6 = nil
 c7 = nil
+-- need to restart in order to reset box.info.vinyl() stats
 test_run:cmd("restart server default")

@@ -967,4 +967,5 @@ test_run:cmd("clear filter")
 ---
 - true
 ...
+-- needed this restart because we need to reset tuple reference counter
 test_run:cmd("restart server default")
