@@ -36,6 +36,7 @@
 #include "memory.h"
 #include "fiber.h"
 #include <third_party/qsort_arg.h>
+#include "say.h"
 
 /* {{{ Utilities. *************************************************/
 
@@ -366,27 +367,43 @@ MemtxTree::reserve(uint32_t size_hint)
 {
 	if (size_hint < build_array_alloc_size)
 		return;
-	build_array = (struct tuple**)
+	struct tuple **tmp = (struct tuple**)
 		realloc(build_array, size_hint * sizeof(struct tuple *));
-	build_array_alloc_size = size_hint;
+	if (!tmp) {
+		say_error("%s realloc error  at %s:%d", __func__,  __FILE__, __LINE__);
+	} else {
+		build_array = tmp;
+		build_array_alloc_size = size_hint;
+	}
 }
 
 void
 MemtxTree::buildNext(struct tuple *tuple)
 {
 	if (!build_array) {
-		build_array = (struct tuple**)malloc(BPS_TREE_EXTENT_SIZE);
+		build_array = (struct tuple**) malloc(BPS_TREE_EXTENT_SIZE);
 		build_array_alloc_size =
 			BPS_TREE_EXTENT_SIZE / sizeof(struct tuple*);
+		if (!build_array) {
+			tnt_raise(OutOfMemory, BPS_TREE_EXTENT_SIZE,
+				"MemtxTree", "buildNext");
+		}
 	}
 	assert(build_array_size <= build_array_alloc_size);
 	if (build_array_size == build_array_alloc_size) {
 		build_array_alloc_size = build_array_alloc_size +
 					 build_array_alloc_size / 2;
-		build_array = (struct tuple**)
+		struct tuple **tmp = (struct tuple**)
 			realloc(build_array,
 				build_array_alloc_size *
 				sizeof(struct tuple *));
+		if (!tmp) {
+			tnt_raise(OutOfMemory, build_array_alloc_size *
+				sizeof(struct tuple *),
+				"MemtxTree", "buildNext");
+			return;
+		}
+		build_array = tmp;
 	}
 	build_array[build_array_size++] = tuple;
 }

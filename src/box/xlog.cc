@@ -546,12 +546,16 @@ xdir_scan(struct xdir *dir)
 		if (s_count == s_capacity) {
 			s_capacity = s_capacity > 0 ? 2 * s_capacity : 16;
 			size_t size = sizeof(*signatures) * s_capacity;
-			signatures = (int64_t *) realloc(signatures, size);
-			if (signatures == NULL) {
+			int64_t *tmp = (int64_t *) realloc(signatures, size);
+			if (tmp == NULL) {
 				tnt_error(OutOfMemory,
 					  size, "realloc", "signatures array");
+				if (signatures) {
+					free(signatures);
+				}
 				return -1;
 			}
+			signatures = tmp;
 		}
 		signatures[s_count++] = signature;
 	}
