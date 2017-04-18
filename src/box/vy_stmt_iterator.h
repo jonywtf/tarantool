@@ -124,6 +124,24 @@ struct vy_iterator_stat {
 	size_t bloom_reflections;
 };
 
+/**
+ * Consistent read view. Originally read-only transactions
+ * receive a read view lsn upon creation and do not see further
+ * changes.
+ * Other transactions are expected to be read-write and
+ * have visibility lsn (vlsn) == INT64_MAX to read newest data.
+ * Once a value read by such a transaction (T) is overwritten by another
+ * commiting transaction, T permanently goes to read view that does
+ * not see this change.
+ * If T does not have any write statements by the commit time it will
+ * be committed successfully, or aborted as conflicted otherwise.
+ */
+struct vy_read_view {
+	struct rlist in_read_views;
+	int64_t vlsn;
+	int refs;
+};
+
 #if defined(__cplusplus)
 } /* extern "C" */
 #endif /* defined(__cplusplus) */

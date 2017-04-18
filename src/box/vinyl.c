@@ -712,26 +712,16 @@ struct vy_tx {
 	/** Current state of the transaction.*/
 	enum tx_state state;
 	/**
-	 * The transaction is forbidden to commit unless it's read-only.
+	 * The read view of current transactions.
+	 * For RW TX it originally points to global_read_view,
+	 *  (that means that the TX see all committed data)
+	 *  but can be changed to a limited visibility read view
+	 *  when some other TX is committed.
+	 * For RO TX it is set to read view that does not see
+	 *  further committed data.
+	 * Must be unreferenced when it not needed any more.
 	 */
-	bool is_in_read_view;
-	/**
-	 * Consistent read view LSN. Originally read-only transactions
-	 * receive a read view lsn upon creation and do not see further
-	 * changes.
-	 * Other transactions are expected to be read-write and
-	 * have vlsn == INT64_MAX to read newest data. Once a value read
-	 * by such a transaction (T) is overwritten by another
-	 * commiting transaction, T permanently goes to read view that does
-	 * not see this change.
-	 * If T does not have any write statements by the commit time it will
-	 * be committed successfully, or aborted as conflicted otherwise.
-	 */
-	int64_t vlsn;
-	union {
-		/** The link in read_views of the TX manager */
-		struct rlist in_read_views;
-	};
+	struct vy_read_view *read_view;
 	/*
 	 * For non-autocommit transactions, the list of open
 	 * cursors. When a transaction ends, all open cursors are
@@ -868,7 +858,7 @@ struct vy_read_iterator {
 	/* search options */
 	enum iterator_type iterator_type;
 	const struct tuple *key;
-	const int64_t *vlsn;
+	struct vy_read_view **read_view;
 
 	/* iterator over ranges */
 	struct vy_range_iterator range_iterator;
@@ -897,7 +887,7 @@ static void
 vy_read_iterator_open(struct vy_read_iterator *itr,
 		      struct vy_index *index, struct vy_tx *tx,
 		      enum iterator_type iterator_type,
-		      const struct tuple *key, const int64_t *vlsn,
+		      const struct tuple *key, struct vy_read_view **read_view,
 		      bool only_disk);
 
 /**
@@ -1011,6 +1001,19 @@ struct tx_manager {
 	struct vy_env *env;
 	struct mempool tx_mempool;
 	struct mempool txv_mempool;
+	struct mempool read_view_mempool;
+	/**
+	 * A unique read view that allows to see all commited data.
+	 */
+	struct vy_read_view global_read_view;
+	/**
+	 * A fixed pointer to global_read_view (needed for iterators)
+	 */
+	struct vy_read_view *global_read_view_ptr;
+	/**
+	 * Last created read view with last_read_view->vlsn == tx_manager->lsn
+	 */
+	struct vy_read_view *last_read_view;
 };
 
 static int
@@ -1075,16 +1078,57 @@ tx_manager_new(struct vy_env *env)
 	rlist_create(&m->read_views);
 	mempool_create(&m->tx_mempool, cord_slab_cache(), sizeof(struct vy_tx));
 	mempool_create(&m->txv_mempool, cord_slab_cache(), sizeof(struct txv));
+	mempool_create(&m->read_view_mempool, cord_slab_cache(),
+		       sizeof(struct vy_read_view));
+	m->global_read_view.refs = 2; /* holded by xm itself and global_read_view_ptr */
+	m->global_read_view.vlsn = INT64_MAX;
+	rlist_create(&m->global_read_view.in_read_views);
+	m->global_read_view_ptr = &m->global_read_view;
+	m->last_read_view = NULL;
 	return m;
 }
 
 static int
 tx_manager_delete(struct tx_manager *m)
 {
+	mempool_destroy(&m->read_view_mempool);
 	mempool_destroy(&m->txv_mempool);
 	mempool_destroy(&m->tx_mempool);
 	free(m);
 	return 0;
+}
+
+static void
+tx_manager_ref_read_view(struct tx_manager *xm, struct vy_read_view *rv, int refs)
+{
+	assert(rv->refs > 0);
+	assert(rv->refs + refs >= 0);
+	rv->refs += refs;
+	if (rv->refs == 0) {
+		assert(rv != &xm->global_read_view);
+		assert(!rlist_empty(&rv->in_read_views));
+		rlist_del_entry(rv, in_read_views);
+		mempool_free(&xm->read_view_mempool, rv);
+	}
+}
+
+static struct vy_read_view *
+tx_manager_get_read_view(struct tx_manager *xm)
+{
+	if (xm->last_read_view != NULL) {
+		assert(xm->last_read_view->vlsn == xm->lsn);
+		return xm->last_read_view;
+	}
+	struct vy_read_view *rv = mempool_alloc(&xm->read_view_mempool);
+	if (rv == NULL) {
+		diag_set(OutOfMemory, sizeof(*rv), "tx manager", "read view");
+		return NULL;
+	}
+	xm->last_read_view = rv;
+	rv->refs = 1; /* referenced by xm->last_read_view */
+	rv->vlsn = xm->lsn;
+	rlist_add_tail_entry(&xm->read_views, rv, in_read_views);
+	return rv;
 }
 
 /*
@@ -1099,8 +1143,8 @@ tx_manager_vlsn(struct tx_manager *xm)
 {
 	if (rlist_empty(&xm->read_views))
 		return xm->lsn;
-	struct vy_tx *lowest = rlist_first_entry(&xm->read_views,
-						 struct vy_tx, in_read_views);
+	struct vy_read_view *lowest = rlist_first_entry(&xm->read_views,
+						 struct vy_read_view, in_read_views);
 	return lowest->vlsn;
 }
 
@@ -4989,6 +5033,16 @@ vy_info_append_performance(struct vy_env *env, struct info_handler *h)
 	info_append_u64(h, "tx_conflict", stat->tx_conflict);
 	info_append_u32(h, "tx_active", env->xm->tx_count);
 
+	struct mempool_stats mp_stats;
+	mempool_stats(&env->xm->read_view_mempool, &mp_stats);
+	info_append_u32(h, "read_view", mp_stats.objcount);
+
+	mempool_stats(&env->xm->tx_mempool, &mp_stats);
+	info_append_u32(h, "tx_allocated", mp_stats.objcount);
+
+	mempool_stats(&env->xm->txv_mempool, &mp_stats);
+	info_append_u32(h, "txv_allocated", mp_stats.objcount);
+
 	info_append_u64(h, "dump_bandwidth", vy_stat_dump_bandwidth(stat));
 	info_append_u64(h, "dump_total", stat->dump_total);
 	info_append_u64(h, "dumped_statements", stat->dumped_statements);
@@ -5801,13 +5855,12 @@ vy_index_get(struct vy_tx *tx, struct vy_index *index, const char *key,
 	if (vykey == NULL)
 		return -1;
 	ev_tstamp start  = ev_now(loop());
-	int64_t vlsn = INT64_MAX;
-	const int64_t *vlsn_ptr = &vlsn;
+	struct vy_read_view **read_view_ptr = &e->xm->global_read_view_ptr;
 	if (tx != NULL)
-		vlsn_ptr = &tx->vlsn;
+		read_view_ptr = &tx->read_view;
 
 	struct vy_read_iterator itr;
-	vy_read_iterator_open(&itr, index, tx, ITER_EQ, vykey, vlsn_ptr, false);
+	vy_read_iterator_open(&itr, index, tx, ITER_EQ, vykey, read_view_ptr, false);
 	if (vy_read_iterator_next(&itr, result) != 0)
 		goto error;
 	if (tx != NULL && vy_tx_track(tx, index, vykey, *result == NULL) != 0) {
@@ -6693,12 +6746,11 @@ vy_tx_create(struct tx_manager *xm, struct vy_tx *tx)
 	tx->start = ev_now(loop());
 	tx->xm = xm;
 	tx->state = VINYL_TX_READY;
-	tx->is_in_read_view = false;
-	rlist_create(&tx->in_read_views);
 	rlist_create(&tx->cursors);
 
 	/* possible read-write tx reads latest changes */
-	tx->vlsn = INT64_MAX;
+	tx->read_view = &xm->global_read_view;
+	tx_manager_ref_read_view(xm, tx->read_view, 1);
 	xm->tx_count++;
 }
 
@@ -6713,10 +6765,10 @@ vy_tx_abort_cursors(struct vy_tx *tx)
 static void
 vy_tx_destroy(struct vy_tx *tx)
 {
-	rlist_del_entry(tx, in_read_views);
-
 	/** Abort all open cursors. */
 	vy_tx_abort_cursors(tx);
+
+	tx_manager_ref_read_view(tx->xm, tx->read_view, -1);
 
 	/* Remove from the conflict manager index */
 	struct txv *v;
@@ -6733,6 +6785,12 @@ vy_tx_is_ro(struct vy_tx *tx)
 	return tx->write_set.rbt_root == &tx->write_set.rbt_nil;
 }
 
+static bool
+vy_tx_is_in_read_view(struct vy_tx *tx)
+{
+	return tx->read_view->vlsn != INT64_MAX;
+}
+
 /**
  * Remember the read in the conflict manager index.
  */
@@ -6740,7 +6798,7 @@ static int
 vy_tx_track(struct vy_tx *tx, struct vy_index *index,
 	    struct tuple *key, bool is_gap)
 {
-	if (tx->is_in_read_view)
+	if (vy_tx_is_in_read_view(tx))
 		return 0; /* no reason to track reads */
 	uint32_t part_count = tuple_field_count(key);
 	if (part_count >= index->index_def->key_def.part_count) {
@@ -6768,7 +6826,7 @@ vy_tx_track(struct vy_tx *tx, struct vy_index *index,
  * Send to a read view all transaction which are reading the stmt v
  *  written by tx.
  */
-static void
+static int
 vy_tx_send_to_read_view(struct vy_tx *tx, struct txv *v)
 {
 	struct tx_manager *xm = tx->xm;
@@ -6790,15 +6848,18 @@ vy_tx_send_to_read_view(struct vy_tx *tx, struct txv *v)
 		if (abort->is_gap && vy_stmt_type(v->stmt) == IPROTO_DELETE)
 			continue;
 		/* already in (earlier) read view */
-		if (abort->tx->is_in_read_view)
+		if (vy_tx_is_in_read_view(abort->tx))
 			continue;
 
 		/* the found tx can only be commited as read-only */
-		abort->tx->is_in_read_view = true;
-		abort->tx->vlsn = xm->lsn;
-		rlist_add_tail_entry(&xm->read_views, abort->tx, in_read_views);
-		assert(abort->tx->vlsn <= abort->tx->xm->lsn);
+		struct vy_read_view *rv = tx_manager_get_read_view(xm);
+		if (rv == NULL)
+			return -1;
+		tx_manager_ref_read_view(xm, abort->tx->read_view, -1);
+		abort->tx->read_view = rv;
+		tx_manager_ref_read_view(xm, abort->tx->read_view, 1);
 	}
+	return 0;
 }
 
 int
@@ -6810,7 +6871,7 @@ vy_prepare(struct vy_tx *tx)
 	int rc = 0;
 
 	/* proceed read-only transactions */
-	if (!vy_tx_is_ro(tx) && tx->is_in_read_view) {
+	if (!vy_tx_is_ro(tx) && vy_tx_is_in_read_view(tx)) {
 		tx->state = VINYL_TX_ROLLBACK;
 		e->stat->tx_conflict++;
 		diag_set(ClientError, ER_TRANSACTION_CONFLICT);
@@ -6822,7 +6883,7 @@ vy_prepare(struct vy_tx *tx)
 			if (vy_tx_write_prepare(v) != 0)
 				rc = -1;
 			/* Abort read/write intersection. */
-			vy_tx_send_to_read_view(tx, v);
+			rc = vy_tx_send_to_read_view(tx, v);
 		}
 	}
 
@@ -6843,8 +6904,14 @@ vy_commit(struct vy_tx *tx, int64_t lsn)
 {
 	struct vy_env *e = tx->xm->env;
 	assert(tx->state == VINYL_TX_COMMIT);
-	if (lsn > e->xm->lsn)
+	if (lsn > e->xm->lsn) {
 		e->xm->lsn = lsn;
+		/* last_read_view will be need no more */
+		if (tx->xm->last_read_view != NULL) {
+			tx_manager_ref_read_view(tx->xm, tx->xm->last_read_view, -1);
+			tx->xm->last_read_view = NULL;
+		}
+	}
 
 	struct txv *v, *tmp;
 	struct vy_quota *quota = &e->quota;
@@ -8160,9 +8227,9 @@ vy_write_iterator_add_run(struct vy_write_iterator *wi, struct vy_run *run)
 	src = vy_merge_iterator_add(&wi->mi, false, false);
 	if (src == NULL)
 		return -1;
-	static const int64_t vlsn = INT64_MAX;
 	vy_run_iterator_open(&src->run_iterator, false, &wi->run_iterator_stat,
-			     &wi->env->run_env, run, ITER_GE, wi->key, &vlsn,
+			     &wi->env->run_env, run, ITER_GE, wi->key,
+			     &wi->env->xm->global_read_view_ptr,
 			     wi->key_def, wi->user_key_def,
 			     wi->surrogate_format, wi->upsert_format,
 			     wi->is_primary);
@@ -8176,9 +8243,8 @@ vy_write_iterator_add_mem(struct vy_write_iterator *wi, struct vy_mem *mem)
 	src = vy_merge_iterator_add(&wi->mi, false, false);
 	if (src == NULL)
 		return -1;
-	static const int64_t vlsn = INT64_MAX;
-	vy_mem_iterator_open(&src->mem_iterator, &wi->mem_iterator_stat,
-			     mem, ITER_GE, wi->key, &vlsn);
+	vy_mem_iterator_open(&src->mem_iterator, &wi->mem_iterator_stat, mem,
+			     ITER_GE, wi->key, &wi->env->xm->global_read_view_ptr);
 	return 0;
 }
 
@@ -8326,7 +8392,7 @@ vy_read_iterator_add_cache(struct vy_read_iterator *itr)
 	struct vy_iterator_stat *stat = &itr->index->env->stat->cache_stat;
 	vy_cache_iterator_open(&sub_src->cache_iterator, stat,
 			       itr->index->cache, itr->iterator_type,
-			       itr->key, itr->vlsn);
+			       itr->key, itr->read_view);
 	bool stop = false;
 	int rc = sub_src->iterator.iface->restore(&sub_src->iterator,
 						  itr->curr_stmt,
@@ -8346,7 +8412,7 @@ vy_read_iterator_add_mem_range(struct vy_read_iterator *itr,
 		sub_src = vy_merge_iterator_add(&itr->merge_iterator,
 						true, true);
 		vy_mem_iterator_open(&sub_src->mem_iterator, stat , range->mem,
-				     itr->iterator_type, itr->key, itr->vlsn);
+				     itr->iterator_type, itr->key, itr->read_view);
 	}
 	/* Add frozen in-memory indexes. */
 	struct vy_mem *mem;
@@ -8354,7 +8420,7 @@ vy_read_iterator_add_mem_range(struct vy_read_iterator *itr,
 		sub_src = vy_merge_iterator_add(&itr->merge_iterator,
 						false, true);
 		vy_mem_iterator_open(&sub_src->mem_iterator, stat , mem,
-				     itr->iterator_type, itr->key, itr->vlsn);
+				     itr->iterator_type, itr->key, itr->read_view);
 	}
 }
 
@@ -8399,7 +8465,7 @@ vy_read_iterator_add_disk(struct vy_read_iterator *itr)
 		vy_run_iterator_open(&sub_src->run_iterator, coio_read, stat,
 				     &itr->index->env->run_env,
 				     run, itr->iterator_type,
-				     itr->key, itr->vlsn,
+				     itr->key, itr->read_view,
 				     &itr->index->index_def->key_def,
 				     &itr->index->user_index_def->key_def,
 				     format, itr->index->upsert_format,
@@ -8439,14 +8505,14 @@ vy_read_iterator_use_range(struct vy_read_iterator *itr)
 static void
 vy_read_iterator_open(struct vy_read_iterator *itr, struct vy_index *index,
 		      struct vy_tx *tx, enum iterator_type iterator_type,
-		      const struct tuple *key, const int64_t *vlsn,
+		      const struct tuple *key, struct vy_read_view **read_view,
 		      bool only_disk)
 {
 	itr->index = index;
 	itr->tx = tx;
 	itr->iterator_type = iterator_type;
 	itr->key = key;
-	itr->vlsn = vlsn;
+	itr->read_view = read_view;
 	itr->only_disk = only_disk;
 	itr->search_started = false;
 	itr->curr_stmt = NULL;
@@ -8657,7 +8723,7 @@ vy_read_iterator_next(struct vy_read_iterator *itr, struct tuple **result)
 	/**
 	 * Add a statement to the cache
 	 */
-	if (*(itr->vlsn) == INT64_MAX) /* Do not store non-latest data */
+	if ((*itr->read_view)->vlsn == INT64_MAX) /* Do not store non-latest data */
 		vy_cache_add(itr->index->cache, *result, prev_key,
 			     itr->key, itr->iterator_type);
 
@@ -9110,9 +9176,8 @@ vy_squash_process(struct vy_squash *squash)
 	assert(index_def->iid == 0);
 
 	struct vy_read_iterator itr;
-	const int64_t lsn = INT64_MAX;
 	vy_read_iterator_open(&itr, index, NULL, ITER_EQ,
-			      squash->stmt, &lsn, false);
+			      squash->stmt, &env->xm->global_read_view_ptr, false);
 	struct tuple *result;
 	int rc = vy_read_iterator_next(&itr, &result);
 	if (rc == 0 && result != NULL)
@@ -9325,7 +9390,7 @@ vy_cursor_new(struct vy_tx *tx, struct vy_index *index, const char *key,
 		unreachable();
 	}
 	vy_read_iterator_open(&c->iterator, index, tx, iterator_type, c->key,
-			      &tx->vlsn, false);
+			      &tx->read_view, false);
 	c->iterator_type = iterator_type;
 	return c;
 }
