@@ -2113,11 +2113,7 @@ vy_run_info_encode(const struct vy_run_info *run_info,
 		   struct xrow_header *xrow)
 {
 	assert(run_info->has_bloom);
-	size_t size = mp_sizeof_map(4);
-	size += mp_sizeof_uint(VY_RUN_INFO_MIN_LSN) +
-		mp_sizeof_uint(run_info->min_lsn);
-	size += mp_sizeof_uint(VY_RUN_INFO_MAX_LSN) +
-		mp_sizeof_uint(run_info->max_lsn);
+	size_t size = mp_sizeof_map(2);
 	size += mp_sizeof_uint(VY_RUN_INFO_PAGE_COUNT) +
 		mp_sizeof_uint(run_info->count);
 	size += mp_sizeof_uint(VY_RUN_INFO_BLOOM) +
@@ -2131,11 +2127,7 @@ vy_run_info_encode(const struct vy_run_info *run_info,
 	memset(xrow, 0, sizeof(*xrow));
 	xrow->body->iov_base = pos;
 	/* encode values */
-	pos = mp_encode_map(pos, 4);
-	pos = mp_encode_uint(pos, VY_RUN_INFO_MIN_LSN);
-	pos = mp_encode_uint(pos, run_info->min_lsn);
-	pos = mp_encode_uint(pos, VY_RUN_INFO_MAX_LSN);
-	pos = mp_encode_uint(pos, run_info->max_lsn);
+	pos = mp_encode_map(pos, 2);
 	pos = mp_encode_uint(pos, VY_RUN_INFO_PAGE_COUNT);
 	pos = mp_encode_uint(pos, run_info->count);
 	pos = mp_encode_uint(pos, VY_RUN_INFO_BLOOM);
@@ -2858,6 +2850,8 @@ vy_index_recovery_cb(const struct vy_log_record *record, void *cb_arg)
 		run = vy_run_new(record->run_id);
 		if (run == NULL)
 			return -1;
+		run->info.min_lsn = record->min_lsn;
+		run->info.max_lsn = record->max_lsn;
 		char index_path[PATH_MAX];
 		vy_run_snprint_path(index_path, sizeof(index_path),
 				    index->path, run->id, VY_FILE_INDEX);
@@ -3365,7 +3359,9 @@ vy_task_dump_complete(struct vy_task *task)
 	 */
 	if (!vy_run_is_empty(range->new_run)) {
 		vy_log_tx_begin();
-		vy_log_insert_run(range->id, range->new_run->id);
+		vy_log_insert_run(range->id, range->new_run->id,
+				  range->new_run->info.min_lsn,
+				  range->new_run->info.max_lsn);
 		if (vy_log_tx_commit() < 0)
 			return -1;
 	} else
@@ -3555,7 +3551,9 @@ vy_task_split_complete(struct vy_task *task)
 		vy_log_insert_range(index->index_def->opts.lsn, r->id,
 				    r->begin, r->end, r->is_level_zero);
 		if (!vy_run_is_empty(r->new_run))
-			vy_log_insert_run(r->id, r->new_run->id);
+			vy_log_insert_run(r->id, r->new_run->id,
+					  r->new_run->info.min_lsn,
+					  r->new_run->info.max_lsn);
 	}
 	if (vy_log_tx_commit() < 0)
 		return -1;
@@ -3802,7 +3800,9 @@ vy_task_coalesce_complete(struct vy_task *task)
 	vy_log_insert_range(index->index_def->opts.lsn, result->id,
 			    result->begin, result->end, result->is_level_zero);
 	if (! vy_run_is_empty(result->new_run))
-		vy_log_insert_run(result->id, result->new_run->id);
+		vy_log_insert_run(result->id, result->new_run->id,
+				  result->new_run->info.min_lsn,
+				  result->new_run->info.max_lsn);
 	/* Delete the old ranges from the log. */
 	while(it != task->coalesce_end) {
 		vy_log_delete_range(it->id);
@@ -3974,7 +3974,9 @@ vy_task_compact_complete(struct vy_task *task)
 	}
 	assert(n == 0);
 	if (!vy_run_is_empty(range->new_run))
-		vy_log_insert_run(range->id, range->new_run->id);
+		vy_log_insert_run(range->id, range->new_run->id,
+				  range->new_run->info.min_lsn,
+				  range->new_run->info.max_lsn);
 	if (vy_log_tx_commit() < 0)
 		return -1;
 
